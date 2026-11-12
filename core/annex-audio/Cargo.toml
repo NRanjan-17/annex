@@ -11,7 +11,7 @@ publish.workspace = true
 [dependencies]
 cpal = "0.18"
 opus2 = { version = "0.4", default-features = false, features = ["backend-libopus", "bundled"] }
-sonora = "0.2"
+sonora = "0.3"
 tracing = "0.1.44"
 
 [lints]
