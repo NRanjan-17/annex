@@ -84,8 +84,10 @@ required reviewers → add the secrets above.
 ## Reproducibility
 
 Pinned: Rust toolchain (`rust-toolchain.toml`), `Cargo.lock` (`--locked` everywhere), Xcode
-(`.xcode-version`, release), .NET SDK (`apps/windows/global.json`), NuGet lock files, action
-SHAs. Rebuilding a tag reproduces the same inputs. Signed and notarized binaries are not
+(`.xcode-version`, release), .NET SDK (`global.json`), NuGet lock files, action
+SHAs. `global.json` stays at the repository root: `dotnet` looks for it from the folder it runs
+in, and CI runs it from the root, so anywhere deeper it is skipped and the runner's newest SDK
+changes the NuGet lock files' implicit packages (`Microsoft.NET.ILLink.Tasks`). Rebuilding a tag reproduces the same inputs. Signed and notarized binaries are not
 byte-for-byte identical across builds (signatures and timestamps differ), and we don't claim
 they are.
 

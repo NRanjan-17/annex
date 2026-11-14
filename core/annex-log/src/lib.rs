@@ -7,6 +7,8 @@
 //! - A flight recorder: the last few thousand lines, kept in memory. When an error is logged or a
 //!   thread panics, they're saved to `crashes/annex-<time>-<why>.log`, so what led up to it stays
 //!   together even after the log has moved on.
+//! - Stall warnings ([`watch`]): a step that should take a moment says so if it's still running
+//!   after a few seconds, and on which thread, since a step that hangs never logs its own line.
 //!
 //! Each line says when, how serious, which part of Annex (the module, e.g.
 //! `annex_session::transfer`), which thread, and the session it belongs to. Secrets (PINs, codes,
@@ -25,6 +27,10 @@ use tracing_subscriber::Layer as _;
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
+
+mod stall;
+
+pub use stall::{Watch, watch};
 
 const FILE_MAX: u64 = 10 * 1024 * 1024;
 /// Lines the flight recorder keeps.

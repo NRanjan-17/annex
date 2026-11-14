@@ -140,6 +140,7 @@ impl Callbacks {
         let me = self.clone();
         Arc::new(move |e: Event| {
             annex_session::log_event(&e);
+            let _watch = annex_log::watch("app", e.name());
             if let Ok(json) = serde_json::to_string(&e) {
                 me.event_json(&json);
             }
@@ -1246,7 +1247,7 @@ pub unsafe extern "C" fn annex_host_start_screen(
 mod win_host {
     use std::collections::{HashMap, HashSet};
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Mutex, OnceLock, Weak};
+    use std::sync::{Arc, Mutex, OnceLock, Weak, mpsc};
     use std::time::Duration;
 
     use annex_media_win::{
@@ -1296,6 +1297,48 @@ mod win_host {
         driver: Option<Arc<VirtualDisplayDriver>>,
         extends: Mutex<HashMap<u64, ExtendSession>>,
         injector: Mutex<Injector>,
+        /// Pipeline work that events ask for, done on the `annex-host-work` thread (see [`Work`]).
+        work: mpsc::Sender<Work>,
+    }
+
+    /// What a keyframe request or a bitrate hint does to a pipeline. Never done where the event
+    /// comes from: the encoder's own thread sends KeyframeRequested from inside its output when the
+    /// frame queue is full (a congested link, like the relay), while the session's network task
+    /// sends BitrateHint and holds the pipeline during the encoder call. Each then waited for the
+    /// other, and the session froze for good: no picture, no input, and Quit couldn't end it
+    /// (0.4.2, Mac viewing Windows through the relay). With the software encoder, the capture thread
+    /// even waited for itself (it holds the pipeline while encoding, and the output asked again).
+    enum Work {
+        /// A keyframe from the session's pipeline: its extend pipeline, or the shared mirror one.
+        Keyframe(u64),
+        /// The extend session's pipeline at this bitrate scale (%).
+        ExtendBitrate(u64, u32),
+        /// The mirror pipeline at the slowest viewer's scale, and the picture size that fits it.
+        MirrorBitrate,
+    }
+
+    impl Work {
+        fn name(&self) -> &'static str {
+            match self {
+                Work::Keyframe(_) => "keyframe",
+                Work::ExtendBitrate(..) => "extend bitrate",
+                Work::MirrorBitrate => "mirror bitrate",
+            }
+        }
+    }
+
+    /// Runs [`Work`] in order until the state goes away (its sender with it).
+    fn spawn_worker(state: &Arc<ScreenState>, jobs: mpsc::Receiver<Work>) {
+        let state = Arc::downgrade(state);
+        let spawned = std::thread::Builder::new().name("annex-host-work".into()).spawn(move || {
+            while let Ok(job) = jobs.recv() {
+                let Some(state) = state.upgrade() else { return };
+                state.run(job);
+            }
+        });
+        if let Err(e) = spawned {
+            tracing::error!("sharing: no thread for keyframes and bitrate changes: {e}");
+        }
     }
 
     fn bitrate(w: u32, h: u32, fps: u32) -> u32 {
@@ -1305,6 +1348,31 @@ mod win_host {
     }
 
     impl ScreenState {
+        fn new(mirror_cfg: HostPipelineConfig, driver: Option<Arc<VirtualDisplayDriver>>) -> Arc<Self> {
+            let prefer_hardware = mirror_cfg.prefer_hardware;
+            let (work, jobs) = mpsc::channel();
+            let state = Arc::new(ScreenState {
+                mirror_cfg,
+                prefer_hardware,
+                host: OnceLock::new(),
+                mirror: Mutex::new(None),
+                mirror_sessions: Mutex::new(HashSet::new()),
+                mirror_scales: Mutex::new(HashMap::new()),
+                mirror_reduced: Mutex::new(false),
+                hevc: AtomicBool::new(
+                    prefer_hardware && crate::VIEWER_HEVC.load(Ordering::Relaxed) && hevc_encoder_available(),
+                ),
+                mirror_codecs: Mutex::new(HashMap::new()),
+                mirror_codec: Mutex::new(Codec::H264),
+                extends: Mutex::new(HashMap::new()),
+                driver,
+                injector: Mutex::new(Injector::default()),
+                work,
+            });
+            spawn_worker(&state, jobs);
+            state
+        }
+
         fn host(&self) -> Option<Arc<HostHandle>> {
             self.host.get().and_then(|w| w.upgrade())
         }
@@ -1731,11 +1799,7 @@ mod win_host {
                             // The only viewer that needed H.264 may have left.
                             self.follow_mirror_codec();
                             // The slowest viewer may have left: the encoder follows the next one.
-                            let lowest = self.lowest_mirror_scale();
-                            if let Some(p) = self.mirror.lock().unwrap().as_ref() {
-                                p.set_bitrate_scale(lowest);
-                            }
-                            self.update_mirror_picture();
+                            self.later(Work::MirrorBitrate);
                         }
                     } else {
                         let me = self.clone();
@@ -1743,25 +1807,14 @@ mod win_host {
                         std::thread::spawn(move || me.end_extend(id));
                     }
                 }
+                // The scales are noted here, in order with SessionEnded; the pipelines change on
+                // the work thread (see `Work`).
                 Event::BitrateHint { session_id, scale_percent } => {
-                    let extend = self.extends.lock().unwrap().get(session_id).map(|e| e.pipeline.clone());
-                    match extend {
-                        Some(p) => {
-                            if let Some(p) = p.lock().unwrap().as_ref() {
-                                p.set_bitrate_scale(*scale_percent);
-                            }
-                        }
-                        None => {
-                            let lowest = {
-                                let mut scales = self.mirror_scales.lock().unwrap();
-                                scales.insert(*session_id, *scale_percent);
-                                scales.values().copied().min().unwrap_or(100)
-                            };
-                            if let Some(p) = self.mirror.lock().unwrap().as_ref() {
-                                p.set_bitrate_scale(lowest);
-                            }
-                            self.update_mirror_picture();
-                        }
+                    if self.extends.lock().unwrap().contains_key(session_id) {
+                        self.later(Work::ExtendBitrate(*session_id, *scale_percent));
+                    } else {
+                        self.mirror_scales.lock().unwrap().insert(*session_id, *scale_percent);
+                        self.later(Work::MirrorBitrate);
                     }
                 }
                 Event::Input { session_id, event } => {
@@ -1771,9 +1824,22 @@ mod win_host {
                         tracing::debug!("input not injected: {e}");
                     }
                 }
-                Event::KeyframeRequested { session_id } => {
-                    let pipeline = self.extends.lock().unwrap().get(session_id).map(|e| e.pipeline.clone());
-                    match pipeline {
+                Event::KeyframeRequested { session_id } => self.later(Work::Keyframe(*session_id)),
+                _ => {}
+            }
+        }
+
+        fn later(&self, job: Work) {
+            // Fails only once the work thread is gone, and with it the pipelines.
+            let _ = self.work.send(job);
+        }
+
+        fn run(self: &Arc<Self>, job: Work) {
+            let _watch = annex_log::watch("sharing", job.name());
+            match job {
+                Work::Keyframe(id) => {
+                    let extend = self.extends.lock().unwrap().get(&id).map(|e| e.pipeline.clone());
+                    match extend {
                         Some(p) => {
                             if let Some(p) = p.lock().unwrap().as_ref() {
                                 p.request_keyframe();
@@ -1786,7 +1852,21 @@ mod win_host {
                         }
                     }
                 }
-                _ => {}
+                Work::ExtendBitrate(id, scale) => {
+                    let extend = self.extends.lock().unwrap().get(&id).map(|e| e.pipeline.clone());
+                    if let Some(p) = extend
+                        && let Some(p) = p.lock().unwrap().as_ref()
+                    {
+                        p.set_bitrate_scale(scale);
+                    }
+                }
+                Work::MirrorBitrate => {
+                    let lowest = self.lowest_mirror_scale();
+                    if let Some(p) = self.mirror.lock().unwrap().as_ref() {
+                        p.set_bitrate_scale(lowest);
+                    }
+                    self.update_mirror_picture();
+                }
             }
         }
     }
@@ -1811,36 +1891,24 @@ mod win_host {
                 None
             }
         };
-        let state = Arc::new(ScreenState {
-            mirror_cfg: HostPipelineConfig {
-                monitor,
-                width,
-                height,
-                fps,
-                bitrate: bitrate(width, height, fps),
-                prefer_hardware,
-                gpu,
-                max_fps: None,
-                hevc: false,
-            },
+        let mirror_cfg = HostPipelineConfig {
+            monitor,
+            width,
+            height,
+            fps,
+            bitrate: bitrate(width, height, fps),
             prefer_hardware,
-            host: OnceLock::new(),
-            mirror: Mutex::new(None),
-            mirror_sessions: Mutex::new(HashSet::new()),
-            mirror_scales: Mutex::new(HashMap::new()),
-            mirror_reduced: Mutex::new(false),
-            hevc: AtomicBool::new(
-                prefer_hardware && crate::VIEWER_HEVC.load(Ordering::Relaxed) && hevc_encoder_available(),
-            ),
-            mirror_codecs: Mutex::new(HashMap::new()),
-            mirror_codec: Mutex::new(Codec::H264),
-            extends: Mutex::new(HashMap::new()),
-            driver,
-            injector: Mutex::new(Injector::default()),
-        });
+            gpu,
+            max_fps: None,
+            hevc: false,
+        };
+        let state = ScreenState::new(mirror_cfg, driver);
         let events: EventSink = {
             let state = state.clone();
             Arc::new(move |e: Event| {
+                // Events come from the session, the encoder and capture threads: a hang here stops
+                // the one it came from, and the log would otherwise only go quiet (0.4.2's freeze).
+                let _watch = annex_log::watch("sharing", e.name());
                 // Wi-Fi low-latency mode while any viewer is connected (host sessions always pair
                 // SessionStarted with SessionEnded).
                 match &e {
@@ -1861,6 +1929,55 @@ mod win_host {
         tracing::info!(hevc, "sharing: HEVC with viewers that decode it");
         let _ = state.host.set(Arc::downgrade(&handle));
         Ok((handle, state))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn state() -> Arc<ScreenState> {
+            let monitor = Monitor {
+                handle: Default::default(),
+                name: String::new(),
+                width: 1440,
+                height: 900,
+                refresh_hz: 60,
+                primary: true,
+            };
+            let cfg = HostPipelineConfig {
+                monitor,
+                width: 1440,
+                height: 900,
+                fps: 60,
+                bitrate: bitrate(1440, 900, 60),
+                prefer_hardware: false,
+                gpu: None,
+                max_fps: None,
+                hevc: false,
+            };
+            ScreenState::new(cfg, None)
+        }
+
+        /// The 0.4.2 freeze: the encoder's thread asked for a keyframe from inside its output while
+        /// the session held the pipeline, and each waited for the other. Events now return at once
+        /// whoever holds the pipeline, and the work is done once it's free.
+        #[test]
+        fn keyframe_and_bitrate_events_never_wait_for_the_pipeline() {
+            let state = state();
+            state.mirror_sessions.lock().unwrap().insert(1);
+            let held = state.mirror.lock().unwrap();
+            let (done, returned) = mpsc::channel();
+            let events = state.clone();
+            std::thread::spawn(move || {
+                events.on_event(&Event::KeyframeRequested { session_id: 1 });
+                events.on_event(&Event::BitrateHint { session_id: 1, scale_percent: 50 });
+                let _ = done.send(());
+            });
+            let waited = returned.recv_timeout(Duration::from_secs(5)).is_err();
+            drop(held);
+            assert!(!waited, "an event waited for the pipeline");
+            assert_eq!(state.lowest_mirror_scale(), 50, "the viewer's scale is noted right away");
+        }
     }
 }
 
