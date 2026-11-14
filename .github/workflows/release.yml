@@ -135,7 +135,7 @@ jobs:
       - run: rustup show active-toolchain || rustup toolchain install
       - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
         with:
-          global-json-file: apps/windows/global.json
+          global-json-file: global.json
       - name: Stamp version into the Rust core
         shell: bash
         env:
