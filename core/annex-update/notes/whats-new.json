@@ -1,5 +1,15 @@
 [
   {
+    "version": "0.4.3",
+    "items": [
+      {
+        "kind": "fixed",
+        "title": "A Windows PC's picture no longer freezes",
+        "detail": "On a slow connection, often over the internet through the relay, the picture and the mouse from a PC stopped about ten seconds in, and the PC couldn't end the session, not even on Quit. The PC's video encoder and the session were waiting for each other. They no longer do."
+      }
+    ]
+  },
+  {
     "version": "0.4.2",
     "items": [
       {
