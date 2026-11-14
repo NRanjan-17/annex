@@ -206,6 +206,40 @@ pub enum Event {
     },
 }
 
+impl Event {
+    /// The event's name, as its JSON `type`: for logs that must not show what it carries.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Event::Listening { .. } => "listening",
+            Event::InternetCode { .. } => "internet_code",
+            Event::InternetJoined { .. } => "internet_joined",
+            Event::InternetRelay { .. } => "internet_relay",
+            Event::InternetCodeEnded { .. } => "internet_code_ended",
+            Event::Connecting { .. } => "connecting",
+            Event::PairingPin { .. } => "pairing_pin",
+            Event::PairingPinRequired { .. } => "pairing_pin_required",
+            Event::PairingFinished { .. } => "pairing_finished",
+            Event::SessionStarted { .. } => "session_started",
+            Event::InputAllowed { .. } => "input_allowed",
+            Event::InputRequested { .. } => "input_requested",
+            Event::DirectLinkRequested { .. } => "direct_link_requested",
+            Event::DirectLinkOffer { .. } => "direct_link_offer",
+            Event::DirectLinkUnavailable { .. } => "direct_link_unavailable",
+            Event::Input { .. } => "input",
+            Event::StreamConfig { .. } => "stream_config",
+            Event::KeyframeRequested { .. } => "keyframe_requested",
+            Event::BitrateHint { .. } => "bitrate_hint",
+            Event::LatencyStats { .. } => "latency_stats",
+            Event::SessionEnded { .. } => "session_ended",
+            Event::ClipboardReceived { .. } => "clipboard_received",
+            Event::TransferStarted { .. } => "transfer_started",
+            Event::TransferProgress { .. } => "transfer_progress",
+            Event::TransferEnded { .. } => "transfer_ended",
+            Event::Error { .. } => "error",
+        }
+    }
+}
+
 pub type EventSink = Arc<dyn Fn(Event) + Send + Sync>;
 
 /// Logs an event the core hands to the app, without what must stay private: PINs, internet codes,
@@ -271,3 +305,22 @@ pub struct FrameOut<'a> {
 }
 
 pub type FrameSink = Arc<dyn Fn(FrameOut<'_>) + Send + Sync>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_event_s_name_is_its_json_type() {
+        let events = [
+            Event::KeyframeRequested { session_id: 1 },
+            Event::BitrateHint { session_id: 1, scale_percent: 50 },
+            Event::SessionEnded { session_id: 1, reason: "quit".into() },
+            Event::Error { message: "x".into() },
+        ];
+        for e in events {
+            let json = serde_json::to_value(&e).unwrap();
+            assert_eq!(json["type"], e.name());
+        }
+    }
+}

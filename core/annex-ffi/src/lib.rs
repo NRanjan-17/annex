@@ -140,6 +140,7 @@ impl Callbacks {
         let me = self.clone();
         Arc::new(move |e: Event| {
             annex_session::log_event(&e);
+            let _watch = annex_log::watch("app", e.name());
             if let Ok(json) = serde_json::to_string(&e) {
                 me.event_json(&json);
             }
@@ -1316,6 +1317,16 @@ mod win_host {
         MirrorBitrate,
     }
 
+    impl Work {
+        fn name(&self) -> &'static str {
+            match self {
+                Work::Keyframe(_) => "keyframe",
+                Work::ExtendBitrate(..) => "extend bitrate",
+                Work::MirrorBitrate => "mirror bitrate",
+            }
+        }
+    }
+
     /// Runs [`Work`] in order until the state goes away (its sender with it).
     fn spawn_worker(state: &Arc<ScreenState>, jobs: mpsc::Receiver<Work>) {
         let state = Arc::downgrade(state);
@@ -1824,6 +1835,7 @@ mod win_host {
         }
 
         fn run(self: &Arc<Self>, job: Work) {
+            let _watch = annex_log::watch("sharing", job.name());
             match job {
                 Work::Keyframe(id) => {
                     let extend = self.extends.lock().unwrap().get(&id).map(|e| e.pipeline.clone());
@@ -1894,6 +1906,9 @@ mod win_host {
         let events: EventSink = {
             let state = state.clone();
             Arc::new(move |e: Event| {
+                // Events come from the session, the encoder and capture threads: a hang here stops
+                // the one it came from, and the log would otherwise only go quiet (0.4.2's freeze).
+                let _watch = annex_log::watch("sharing", e.name());
                 // Wi-Fi low-latency mode while any viewer is connected (host sessions always pair
                 // SessionStarted with SessionEnded).
                 match &e {
