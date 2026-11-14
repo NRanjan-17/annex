@@ -367,9 +367,12 @@ impl HardwareEncoder {
         self.force_key.store(true, Ordering::Release);
     }
 
-    /// Changes the target bitrate mid-stream (adaptive bitrate).
-    pub fn set_bitrate(&self, bitrate: u32) {
-        set_mean_bitrate(&self.mft, bitrate);
+    /// The encoder's bitrate control (adaptive bitrate), to use without holding the pipeline: an
+    /// asynchronous MFT is free-threaded, and its own thread uses it without that lock anyway. A
+    /// vendor's encoder may make the change wait for its thread, which can be waiting for a frame
+    /// from capture.
+    pub fn rate_control(&self) -> RateControl {
+        RateControl(SendMft(self.mft.clone()))
     }
 
     /// Queues an NV12 texture (stream size). If the encoder is busy, the previous queued frame
@@ -383,6 +386,15 @@ impl HardwareEncoder {
 struct SendMft(IMFTransform);
 // SAFETY: see HardwareEncoder.
 unsafe impl Send for SendMft {}
+
+/// See [`HardwareEncoder::rate_control`].
+pub struct RateControl(SendMft);
+
+impl RateControl {
+    pub fn set_bitrate(&self, bitrate: u32) {
+        set_mean_bitrate(&self.0.0, bitrate);
+    }
+}
 
 fn event_loop(
     mft: &IMFTransform,

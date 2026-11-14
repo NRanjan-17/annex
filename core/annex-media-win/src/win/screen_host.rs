@@ -362,9 +362,17 @@ impl HostPipeline {
     /// Adaptive bitrate: run the encoder at `percent` % of the configured bitrate.
     pub fn set_bitrate_scale(&self, percent: u32) {
         let bitrate = (self.base_bitrate as u64 * percent as u64 / 100).clamp(500_000, u32::MAX as u64) as u32;
-        match &self.inner.lock().unwrap().encoder {
-            Encoder::Hardware(h) => h.set_bitrate(bitrate),
-            Encoder::Software { enc, .. } => enc.set_bitrate(bitrate),
+        // The hardware encoder's change is made after the lock is let go, so capture never waits
+        // for it (see `HardwareEncoder::rate_control`). The software one runs under the lock.
+        let hardware = match &self.inner.lock().unwrap().encoder {
+            Encoder::Hardware(h) => Some(h.rate_control()),
+            Encoder::Software { enc, .. } => {
+                enc.set_bitrate(bitrate);
+                None
+            }
+        };
+        if let Some(rate) = hardware {
+            rate.set_bitrate(bitrate);
         }
     }
 
